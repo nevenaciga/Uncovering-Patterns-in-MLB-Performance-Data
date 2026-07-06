@@ -1,0 +1,602 @@
+---
+title: "Uncovering Patterns in MLB Performance Data"
+author: "Nevena Ciganovic, Adele Lauzon, and Joanna Lo"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+```
+
+
+## Load Data and Feature Engineering
+
+```{r load-data-and-feature-engineering}
+set.seed(2201)
+
+# Load Statcast 2019 data
+data <- read_csv("Statcast_2019.csv")
+
+# Remove deprecated and irrelevant columns
+data_cleaned <- data %>%
+  select(-contains("deprecated"), -spin_dir, -umpire, -game_date, -game_type) %>%
+  drop_na(release_speed)
+
+# Feature engineering: create outcome labels and custom variables
+data_cleaned <- data_cleaned %>%
+  mutate(
+    team_at_bat = ifelse(inning_topbot == "Top", "away", "home"),
+
+      type_of_hit = case_when(
+        events == "sac_fly_double_play" | events == "sac_fly" ~ "sac_fly",
+        events == "sac_bunt_double_play" | events == "sac_bunt" ~ "sac_bunt",
+        events == "home_run" ~ "home_run",
+        events == "single" ~ "single",
+        events == "double" ~ "double",
+        events == "triple" ~ "triple"
+      ),
+
+      outcome = case_when(
+        events == "home_run" ~ "home_run",
+        events %in% c("single", "double", "triple") ~ "hit",
+        events %in% c("field_out", "force_out", "fly_out", "grounded_into_double_play",
+                     "lineout", "double_play", "strikeout", "strikeout_double_play",
+                     "fielders_choice_out", "other_out") ~ "out"
+      )
+  )
+```
+
+## Data Description and Exploratory Plots
+
+```{r data-description-and-exploratory-plots}
+# Summary statistics of selected numeric features
+data_cleaned %>%
+  select(exit_velocity = launch_speed, launch_angle, release_speed,
+         plate_x, plate_z, hit_distance_sc, woba_value) %>%
+  summary()
+
+# Plot 1: Exit velocity by batted ball outcome
+ggplot(data_cleaned, aes(x = outcome, y = launch_speed)) +
+   geom_boxplot(fill = "lightgreen") +
+   labs(title = "Exit Velocity by Outcome", x = "Outcome", y = "Exit Velocity (mph)") +
+   theme_minimal()
+
+# Plot 2: Hit coordinates by type of hit
+ggplot(filter(data_cleaned, !is.na(type_of_hit)),
+       aes(x = hc_x, y = hc_y, color = type_of_hit)) +
+  geom_point(alpha = 0.2, size = 0.8) +
+  scale_y_reverse() +
+  coord_fixed() +
+  labs(title = "Hit Coordinates of Batted Balls", x = "X", y = "Y") +
+  guides(colour = guide_legend(title = "Type of Hit", override.aes = list(alpha = 1))) +
+  theme_minimal() +
+  theme(panel.border = element_blank())
+
+# Plot 3: wOBA by pitch type
+ggplot(data_cleaned, aes(x = pitch_type, y = woba_value)) +
+  geom_boxplot(fill = "lightblue") +
+  labs(title = "wOBA by Pitch Type", x = "Pitch Type", y = "wOBA") +
+  theme_minimal()
+```
+
+## Check Assumptions for Multinomial Logistic Regression
+
+```{r check-assumptions-for-multinomial-logist}
+# Load libraries
+library(tidyr)
+library(dplyr)
+library(corrplot)
+library(ggplot2)
+library(purrr)
+library(nnet)
+
+# 1. Check Multicollinearity
+
+# Keep only numeric columns with more than one unique value and no all-NA columns
+numeric_clean <- data_cleaned %>%
+  dplyr::select(where(is.numeric)) %>%
+  dplyr::select(where(~ !all(is.na(.)))) %>%
+  dplyr::select(where(~ length(unique(.)) > 1)) 
+
+# Compute correlation matrix
+cor_matrix <- cor(numeric_clean, use = "complete.obs")
+
+# Plot correlation matrix
+corrplot::corrplot(
+  cor_matrix,
+  method = "color",
+  tl.cex = 0.7,
+  title = "Correlation Matrix of Numeric Features",
+  mar = c(0, 0, 2, 0),
+  na.label = " "  # optional: remove NA squares completely
+)
+
+# 2. Linearity of Log-Odds
+
+# Extract numeric predictor names
+numeric_vars <- data_cleaned %>%
+  dplyr::select(where(is.numeric)) %>%
+  names()
+
+# Split features into chunks for better plotting
+feature_chunks <- split(numeric_vars, ceiling(seq_along(numeric_vars) / 6))
+
+# Density plots to visually check log-odds linearity
+walk2(
+  feature_chunks,
+  seq_along(feature_chunks),
+  ~{
+    data_long <- data_cleaned %>%
+      dplyr::select(all_of(.x), outcome) %>%
+      pivot_longer(cols = -outcome, names_to = "feature", values_to = "value")
+    
+    p <- ggplot(data_long, aes(x = value, color = outcome)) +
+      geom_density(na.rm = TRUE) +
+      facet_wrap(~feature, scales = "free", ncol = 3) +
+      theme_minimal() +
+      labs(
+        title = paste("Log-Odds Linearity Check: Group", .y),
+        x = "Feature Value",
+        y = "Density"
+      )
+    
+    print(p)
+  }
+)
+```
+
+## Check Assumptions for LDA/QDA
+
+```{r check-assumptions-for-lda-qda}
+# Load libraries
+library(MASS)
+library(car)
+library(ggpubr)
+library(biotools)              # For Box s M test
+library(caret)
+library(tidyverse)
+
+# Subset numeric features only
+numeric_vars <- data_cleaned %>%
+  dplyr::select(where(is.numeric)) %>%
+  dplyr::select(-contains("deprecated"))
+
+# Combine with outcome
+lda_data <- bind_cols(numeric_vars, outcome = data_cleaned$outcome)
+
+# Multivariate Normality Check
+library(purrr)
+
+# Split the data by class
+split_data <- lda_data %>%
+  group_by(outcome) %>%
+  group_split()
+
+# Apply Shapiro-Wilk test for each numeric column in each group
+normality_results <- map_df(split_data, function(df) {
+  outcome_label <- unique(df$outcome)
+  numeric_cols <- df %>% dplyr::select(where(is.numeric))
+
+     result <- map_dbl(numeric_cols, function(col) {
+        if (length(na.omit(col)) >= 3 && length(na.omit(col)) <= 5000) {
+          shapiro.test(col)$p.value
+        } else {
+        }
+     })
+
+     tibble(outcome = outcome_label, !!!as.list(result))
+})
+
+print(normality_results)
+
+
+# Plot one feature to visualize normality
+ggplot(lda_data, aes(x = launch_speed, fill = outcome)) +
+  geom_density(alpha = 0.5) +
+  labs(title = "Density Plot of Launch Speed by Outcome")
+```
+
+## Models: Random Forest, XGBoost, Feedforward Neural Network
+
+```{r models-random-forest-xgboost-feedforward}
+# Load libraries
+library(tidyverse)
+library(caret)
+library(recipes)
+library(rsample)
+library(randomForest)
+library(xgboost)
+library(nnet)
+library(yardstick)
+library(pROC)
+library(ggplot2)
+library(reshape2)
+library(doParallel)
+
+# Register parallel backend
+cl <- makePSOCKcluster(parallel::detectCores() - 1)
+
+# Feature selection
+selected_features <- c(
+  "outcome",
+  "launch_speed",
+  "launch_angle",
+  "hit_distance_sc",
+  "bb_type",
+  "plate_x",
+  "plate_z",
+  "hc_x",
+  "hc_y",
+  "stand",
+  "pitch_type",
+)
+
+# Filter
+swing_data <- data_cleaned %>%
+  dplyr::select(all_of(selected_features)) %>%
+  filter(complete.cases(.))
+
+# Train-test split
+set.seed(123)
+split <- initial_split(swing_data, prop = 0.8, strata = outcome)
+train_data <- training(split)
+test_data <- testing(split)
+
+# Preprocessing
+rec <- recipe(outcome ~ ., data = train_data) %>%
+  step_zv(all_predictors()) %>%
+  step_dummy(all_nominal(), -all_outcomes()) %>%
+  step_normalize(all_numeric(), -all_outcomes())
+
+prep_rec <- prep(rec)
+train_baked <- bake(prep_rec, new_data = NULL)
+test_baked <- bake(prep_rec, new_data = test_data)
+
+# CV
+ctrl <- trainControl(method = "cv", number = 5, classProbs = TRUE, savePredictions = "final")
+
+# Evaluation Metrics
+eval_metrics <- function(truth, preds, model_name, palette) {
+  acc <- mean(preds == truth)
+  cat(paste0("\n", model_name, " - Accuracy: ", round(acc, 3), "\n\n"))
+
+  # Confusion Matrix
+  cm <- confusionMatrix(preds, truth)
+
+
+
+    print(cm)
+
+    # Precision, Recall, F1
+    df <- tibble(truth = truth, prediction = preds)
+    cat("\nPrecision:\n")
+    print(precision(df, truth = truth, estimate = prediction))
+    cat("\nRecall:\n")
+    print(recall(df, truth = truth, estimate = prediction))
+    cat("\nF1 Score:\n")
+    print(f_meas(df, truth = truth, estimate = prediction))
+
+    # Confusion Matrix Heatmap
+    cm_table <- table(Truth = truth, Prediction = preds)
+    cm_df <- as.data.frame(cm_table)
+
+    ggplot(cm_df, aes(x = Prediction, y = Truth, fill = Freq)) +
+      geom_tile(color = "white") +
+      geom_text(aes(label = Freq), size = 5) +
+      scale_fill_gradient(low = "white", high = palette) +
+      labs(title = paste(model_name, "- Confusion Matrix Heatmap"),
+           x = "Predicted Class", y = "Actual Class") +
+      theme_minimal()
+}
+
+# Random Forest
+set.seed(123)
+rf_model <- caret::train(
+  outcome ~ .,
+  data = train_baked,
+  method = "rf",
+  trControl = ctrl,
+  ntree = 200,
+  importance = TRUE
+)
+rf_preds <- predict(rf_model, newdata = test_baked)
+rf_probs <- predict(rf_model, newdata = test_baked, type = "prob")
+eval_metrics(test_baked$outcome, rf_preds, "Random Forest", "deepskyblue")
+
+# XGBoost
+set.seed(123)
+xgb_model <- train(
+  outcome ~ .,
+  data = train_baked,
+  method = "xgbTree",
+  trControl = ctrl,
+  tuneLength = 3,
+  verbose = TRUE
+)
+xgb_preds <- predict(xgb_model, newdata = test_baked)
+xgb_probs <- predict(xgb_model, newdata = test_baked, type = "prob")
+eval_metrics(test_baked$outcome, xgb_preds, "XGBoost", "mediumpurple")
+
+# Neural Network
+set.seed(123)
+nnet_model <- train(
+  outcome ~ .,
+  data = train_baked,
+  method = "nnet",
+  trControl = ctrl,
+  tuneLength = 5,
+  trace = FALSE,
+  maxit = 200
+)
+nnet_preds <- predict(nnet_model, newdata = test_baked)
+nnet_probs <- predict(nnet_model, newdata = test_baked, type = "prob")
+eval_metrics(test_baked$outcome, nnet_preds, "Neural Net", "hotpink")
+
+# Stop parallel cluster
+stopCluster(cl)
+```
+
+## RQ2: Clustering Hit Ball Locations
+
+## Spectral Clustering
+
+```{r spectral-clustering}
+set.seed(123)
+
+# Reduce dataset to 5000 samples for clustering
+only_hits_reduced <- sample_n(only_hits, size = 5000)
+
+# Visualize subsampled data
+ggplot(data = only_hits_reduced,
+       mapping = aes(hc_x, hc_y, colour = type_of_hit)) +
+  geom_point(alpha = 0.2, size = 0.8) +
+  scale_y_reverse() +
+  coord_fixed() +
+  labs(title = "Hit Coordinates of Batted Balls (Subset)", x = "X", y = "Y") +
+  guides(colour = guide_legend(title = "Type of Hit", override.aes = list(alpha = 1))) +
+  theme_minimal() +
+  theme(panel.border = element_blank())
+
+set.seed(123)
+
+# Format for spectral clustering
+loc_data <- only_hits_reduced %>% select(hc_x, hc_y)
+loc_matrix <- as.matrix(loc_data)
+loc_matrix <- scale(loc_matrix, scale = FALSE, center = TRUE)
+
+# Perform spectral clustering
+
+# Define k-nearest neighbors function
+knn <- function(values, k) {
+  index <- order(values, decreasing = TRUE)[(1:k) + 1]
+  values[-index] <- NA
+  return(values)
+}
+
+# Construct similarity and adjacency matrices
+S <- exp(-1/2 * as.matrix(dist(loc_matrix)))
+W <- apply(S, 2, function(x) knn(x, k = 20))
+W <- (W + t(W)) / 2
+W[is.na(W)] <- 0
+
+# Compute Laplacian
+D <- diag(colSums(W))
+L <- D - W
+
+# Eigen decomposition
+n <- nrow(L)
+ED <- eigen(L)
+
+set.seed(123)
+
+# Try different values of K for k-means
+for(K in 1:6){
+  # Find last K eigen vectors of L
+  U = ED$vectors[, (n-K+1):n]
+  # Run k-means on last K eigen vectors of L
+  KM = kmeans(U, centers = K, iter.max = 100, nstart = 10)
+  # Print output
+  print(scatterplot(only_hits_reduced, KM$cluster))
+}
+
+set.seed(123)
+
+# Plot clustered results
+plt <- ggplot()+
+  geom_point(data.frame(only_hits_reduced, cluster = as.factor(KM$cluster)),
+             alpha=0.5, mapping = aes(hc_x, hc_y, color = cluster, shape=type_of_hit)) +
+  scale_y_reverse() + labs(title = "Hit Coordinates of Batted Balls", x = "X", y = "Y") +
+  guides(colour = guide_legend(override.aes = list(alpha = 1))) + theme_bw()
+```
+
+## RQ3: Key Factors Behind Player Performance
+
+```{r rq3-key-factors-behind-player-performanc}
+# Remove identifiers and irrelevant fields
+data_q3 <- data_cleaned %>% select(-player_name, -batter, -pitcher, -des, -sv_id,
+                                             -game_pk, -contains("fielder"), -game_year, -on_1b,
+                                             -on_2b, -on_3b, -pitcher.1, -inning_topbot, -...1)
+
+#  foul or strike (not the third). So, can impute “none” for missing variables here.
+# Identify variable types
+character_cols <- colnames(data_q3[, sapply(data_q3, class) == 'character'])
+numeric_cols <- colnames(data_q3[, sapply(data_q3, class) == 'numeric'])
+
+# Impute missing values
+data_q3_imputed <- data_q3 %>%
+  mutate_at(character_cols, ~replace_na(., "None")) %>%
+  mutate_at(numeric_cols, ~replace_na(., 0))
+
+# Select features fixed at time of bat
+data_q3_reduced <- data_q3_imputed %>%
+  select(pitch_type, release_speed, release_pos_x, release_pos_y, release_pos_z, zone,
+         stand, p_throws, balls, strikes, pfx_x, pfx_z, plate_x, plate_z, outs_when_up,
+         inning, vx0, vy0, vz0, ax, ay, az, sz_top, sz_bot, effective_speed,
+         release_spin_rate, release_extension, launch_speed_angle, at_bat_number,
+         pitch_number, pitch_name, home_score, away_score, bat_score, fld_score,
+         if_fielding_alignment, of_fielding_alignment, spin_axis, team_at_bat, woba_value)
+
+X <- data_q3_reduced %>% select(-woba_value)
+y <- data_q3_reduced %>% select(woba_value)
+
+# Find character columns
+character_cols = colnames(X[, sapply(X, class) == 'character'])
+numeric_cols = colnames(X[, sapply(X, class) == 'numeric'])
+
+# Normalize numeric, one-hot encode categorical
+X_numeric <- X[numeric_cols]
+X_normalized <- scale(X_numeric)
+y_normalized <- scale(y)
+
+X_char <- X[character_cols]
+X_char <- lapply(X_char, factor)
+X_char <- as.data.table(X_char)
+X_onehot <- one_hot(X_char)
+
+X_full <- cbind(as.data.frame(X_numeric), as.data.frame(X_onehot))
+# Calculate the correlation matrix
+cor_matrix <- cor(X_numeric)
+corrplot(cor_matrix, diag = FALSE, method = "color", type = "upper", tl.cex = 0.5,
+         mar = c(1, 1, 2.5, 1))
+```
+
+## PCA
+
+```{r pca}
+# Run PCA and create scree plot
+PCA <- prcomp(X_full, center = TRUE, scale. = FALSE)
+summ <- summary(PCA)
+ve <- summ$importance[2,]
+
+barplot(ve) +
+  labs(title = "Scree Plot of PCA") +
+  xlab("Principal Component") +
+  ylab("Variance Explained") +
+  ylim(0, 1)
+# Print cumulative variance
+```
+
+## Model Training: XGBoost
+
+```{r model-training-xgboost}
+set.seed(1013)
+q3_pcs <- PCA$x[,1:2]
+q3_pcs <- as.data.frame(cbind(q3_pcs, y_normalized))
+
+# Data split
+trainIndex <- createDataPartition(q3_pcs$woba_value, p = 0.8, list = FALSE)
+train_data <- q3_pcs[trainIndex, ]
+test_data <- q3_pcs[-trainIndex, ]
+
+# Convert data to matrix format (XGBoost requires matrices)
+train_matrix <- as.matrix(train_data[, 1:2])
+test_matrix <- as.matrix(test_data[, 1:2])
+train_label <- train_data$woba_value
+test_label <- test_data$woba_value
+# Convert data to XGBoost matrix format
+dtrain <- xgb.DMatrix(data = as.matrix(train_data[, -which(names(train_data) == "woba_value")]),
+                      label = train_data$woba_value)
+
+# Define XGBoost parameters
+params <- list(
+  objective = "reg:squarederror",   # Regression task
+  eta = 0.1,                        # Learning rate
+  max_depth = 6,                    # Tree depth
+  subsample = 0.5                   # Row sampling
+
+)
+
+# Perform 5-fold cross-validation
+cv_results <- xgb.cv(
+  params = params,
+  data = dtrain,
+  nrounds = 100,        # Number of boosting rounds
+  nfold = 5,            # 5-fold CV
+  metrics = "rmse",     # Evaluate using RMSE
+  early_stopping_rounds = 10, # Stop early if no improvement
+  verbose = FALSE
+)
+
+# Print best iteration based on CV results
+best_nrounds <- cv_results$best_iteration
+
+# Train final model with best nrounds
+xgb_model <- xgboost(
+  params = params,
+  data = dtrain,
+  nrounds = best_nrounds, # Use best number of rounds
+  verbose = FALSE
+)
+test_pred <- predict(xgb_model, test_matrix)
+test_data <- tibble(pred = test_pred, actual = test_label)
+
+# Scatter plot of predictions vs actuals
+ggplot(test_data, aes(x = pred, y = actual)) +
+  geom_point() +
+  geom_abline()
+
+# Compute RMSE
+test_data %>%
+  mutate(residuals = actual - pred) %>%
+  summarize(rmse = sqrt(mean(residualsˆ2)))
+
+# Find range of the outcomes to see if RMSE is decent
+
+# Get feature importance from XGBoost model
+importance_matrix <- xgb.importance(model = xgb_model)
+print(importance_matrix)
+
+# Plot feature importance
+xgb.plot.importance(importance_matrix)
+
+# Get PCA loadings
+loadings <- PCA$rotation[, 1:2]   # Loadings for first 2 PCs
+
+# Find top contributing original variables for the most important PCs
+top_pcs <- importance_matrix$Feature[1:2] # Top 5 PCs from XGBoost
+for (pc in top_pcs) {
+  cat("\nTop contributing variables for", pc, ":\n")
+  print(sort(abs(loadings[, pc]), decreasing = TRUE)[1:5]) # Show top 5 variables per PC
+}
+
+# Create a list to store the top contributing variables for each PC
+top_pcs <- importance_matrix$Feature[1:2] # Top 2 PCs from XGBoost
+bubble_data <- list()
+
+for (pc in top_pcs) {
+  # Get top 5 variables for the PC
+  top_contrib <- sort(abs(loadings[, pc]), decreasing = TRUE)[1:5]
+  top_contrib_df <- data.frame(
+    Variable = names(top_contrib),
+    Contribution = top_contrib,
+    PC = rep(pc, length(top_contrib)),
+    Size = abs(top_contrib) * 10
+  )
+  bubble_data[[pc]] <- top_contrib_df
+}
+
+# Combine all data frames into one
+bubble_data_all <- do.call(rbind, bubble_data)
+bubble_data_all <- bubble_data_all %>%
+  mutate(vartext = case_when(
+    Variable == "spin_axis" ~ "Pitch Spin Axis",
+    Variable == "ax" ~ "Pitch Acceleration, X",
+    Variable == "ay" ~ "Pitch Acceleration, Y",
+    Variable == "az" ~ "Pitch Acceleration, Z",
+    Variable == "vy0" ~ "Pitch Velocity, Y",
+    Variable == "effective_speed" ~ "Pitch Speed from Extension",
+    Variable == "release_spin_rate" ~ "Pitch Spin Rate"
+
+           ))
+
+# Create a bubble plot
+ggplot(bubble_data_all, aes(x = reorder(vartext, Contribution), y = PC,
+                            size = Size, color = PC)) +
+  geom_point(alpha = 0.6) +
+  scale_size_continuous(range = c(3, 10)) + #
+  labs(title = "Bubble Plot of Top Contributing Variables for PCs",
+       x = "Variable", y = "Principal Component", size = "Contribution", color = "PC") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+```
