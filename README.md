@@ -6,7 +6,7 @@ This project analyzes Major League Baseball Statcast data to uncover patterns in
 
 The project was completed for a graduate-level statistical learning course and focuses on three complementary questions: predicting whether a batted ball results in a hit, out, or home run; identifying hit type from batted ball coordinates; and determining which game-situation features contribute most to offensive performance.
 
-![Hit Coordinates of Batted Balls](figures/hit_coordinates.png)
+![Hit Coordinates of Batted Balls](figures/fig3.png)
 
 *Figure 1. Hit coordinates of batted balls colored by type of hit.*
 
@@ -119,27 +119,26 @@ Traditional models such as multinomial logistic regression, LDA, and QDA were co
 ## Repository Structure
 
 ```text
-MLB-Performance-Analysis/
+MLB-Statcast-Analysis/
 │
-├── analysis/
-│   └── MLB_Analysis_Final.Rmd
-│
-├── data/
-│   └── Statcast_2019.csv
-│
-├── figures/
-│   ├── exit_velocity_by_outcome.png
-│   ├── hit_coordinates.png
-│   ├── woba_by_pitch_type.png
-│   ├── confusion_matrix_random_forest.png
-│   └── spectral_clustering.png
-│
-├── report/
-│   ├── Report.pdf
-│   └── mlb_analysis_final.pdf
-│
+├── analysis/    # R Markdown analysis and supporting files
+├── figures/     # Exploratory analysis, model diagnostics, and results
+├── report/      # Final project report
 └── README.md
 ```
+
+---
+
+## Data
+
+The full Statcast 2019 dataset is not included in this repository due to GitHub file size limitations.
+
+The dataset used in this project can be downloaded from Kaggle:
+
+**MLB Statcast Data (2019)**  
+https://www.kaggle.com/datasets/s903124/mlb-statcast-data?select=Statcast_2019.csv
+
+The dataset contains Statcast tracking data from the 2019 Major League Baseball season, including launch speed, launch angle, hit distance, pitch characteristics, pitch location, and batted-ball outcomes used for model development and evaluation.
 
 ---
 
@@ -165,11 +164,12 @@ The analysis was conducted in **R** using packages including:
 
 ## Reproducibility
 
-1. Clone the repository.
-2. Download or place `Statcast_2019.csv` in the `data/` folder.
-3. Open `analysis/MLB_Analysis_Final.Rmd`.
-4. Install the required R packages.
-5. Knit the R Markdown file to reproduce the analysis, figures, and model results.
+1. Clone this repository.
+2. Download `Statcast_2019.csv` from the Kaggle dataset linked above.
+3. Place the dataset in your working directory and update file paths if necessary.
+4. Open `analysis/MLB_Analysis_Final.Rmd`.
+5. Install the required R packages listed in the report.
+6. Knit the R Markdown file to reproduce the exploratory analysis, model development, evaluation metrics, and figures.
 
 ---
 
